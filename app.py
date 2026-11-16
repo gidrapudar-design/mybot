@@ -1,7 +1,7 @@
 import os
-import json
 import asyncio
 import logging
+import asyncpg
 from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
@@ -39,6 +39,118 @@ try:
 except FileNotFoundError:
     OWNER_ID = "НЕ_УКАЗАН"
 
+# --- БАЗА ДАННЫХ (SUPABASE) ---
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL не найден в переменных окружения!")
+
+db_pool = None
+
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    async with db_pool.acquire() as conn:
+        # Таблица для статусов (друзья, опущенные, создатели)
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS user_statuses (
+                user_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL
+            )
+        ''')
+        # Таблица для кастомных правил
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS custom_rules (
+                user_id TEXT PRIMARY KEY,
+                rule_text TEXT NOT NULL
+            )
+        ''')
+        # Таблица для профилей (имена)
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS profiles (
+                user_id TEXT PRIMARY KEY,
+                first_name TEXT,
+                username TEXT,
+                last_seen TEXT
+            )
+        ''')
+        # Таблица для истории чатов
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS chat_history (
+                chat_id TEXT,
+                role TEXT,
+                text TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+    logger.info("✅ База данных Supabase подключена и таблицы готовы.")
+
+# --- ФУНКЦИИ РАБОТЫ С БД ---
+async def db_get_status(user_id: str):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow('SELECT status FROM user_statuses WHERE user_id = $1', user_id)
+        return row['status'] if row else "ОБЫЧНЫЙ"
+
+async def db_set_status(user_id: str, status: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            INSERT INTO user_statuses (user_id, status) VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET status = $2
+        ''', user_id, status)
+
+async def db_get_rule(user_id: str):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow('SELECT rule_text FROM custom_rules WHERE user_id = $1', user_id)
+        return row['rule_text'] if row else None
+
+async def db_set_rule(user_id: str, rule_text: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            INSERT INTO custom_rules (user_id, rule_text) VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET rule_text = $2
+        ''', user_id, rule_text)
+
+async def db_del_rule(user_id: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute('DELETE FROM custom_rules WHERE user_id = $1', user_id)
+
+async def db_get_all_with_status(status: str):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch('SELECT user_id FROM user_statuses WHERE status = $1', status)
+        return [row['user_id'] for row in rows]
+
+async def db_save_profile(user_id: str, first_name: str, username: str, last_seen: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            INSERT INTO profiles (user_id, first_name, username, last_seen) VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id) DO UPDATE SET first_name = $2, username = $3, last_seen = $4
+        ''', user_id, first_name, username, last_seen)
+
+async def db_get_profile_name(user_id: str):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow('SELECT first_name FROM profiles WHERE user_id = $1', user_id)
+        return row['first_name'] if row and row['first_name'] else "—"
+
+async def db_get_history(chat_id: str, limit=50):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch('''
+            SELECT role, text FROM chat_history 
+            WHERE chat_id = $1 
+            ORDER BY timestamp ASC LIMIT $2
+        ''', chat_id, limit)
+        return [{"role": r["role"], "text": r["text"]} for r in rows]
+
+async def db_add_history(chat_id: str, role: str, text: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            INSERT INTO chat_history (chat_id, role, text) VALUES ($1, $2, $3)
+        ''', chat_id, role, text)
+
+async def db_clear_history(chat_id: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute('DELETE FROM chat_history WHERE chat_id = $1', chat_id)
+
+
+# --- GEMINI ---
 raw_keys = os.environ.get("GEMINI_API_KEY", "").strip().replace('\ufeff', '')
 if not raw_keys:
     raise ValueError("GEMINI_API_KEY не найден")
@@ -47,67 +159,23 @@ api_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
 clients = [genai.Client(api_key=key) for key in api_keys]
 logger.info(f"✅ Успешно загружено ключей Gemini: {len(clients)}")
 
-PROFILES_FILE = BASE_DIR / 'profiles.json'
-SPECIAL_USERS_FILE = BASE_DIR / 'special_users.json'
-CUSTOM_RULES_FILE = BASE_DIR / 'custom_rules.json'
-SESSIONS_DIR = BASE_DIR / 'sessions'
-SESSIONS_DIR.mkdir(exist_ok=True)
-
-if PROFILES_FILE.exists():
-    with open(PROFILES_FILE, 'r', encoding='utf-8') as f:
-        user_profiles = json.load(f)
-else:
-    user_profiles = {}
-
-if SPECIAL_USERS_FILE.exists():
-    with open(SPECIAL_USERS_FILE, 'r', encoding='utf-8') as f:
-        special_users = json.load(f)
-    if "creators" not in special_users:
-        special_users["creators"] = []
-else:
-    special_users = {"friends": [], "losers": [], "creators": []}
-
-if CUSTOM_RULES_FILE.exists():
-    with open(CUSTOM_RULES_FILE, 'r', encoding='utf-8') as f:
-        custom_rules = json.load(f)
-else:
-    custom_rules = {}
-
-def save_profiles():
-    with open(PROFILES_FILE, 'w', encoding='utf-8') as f:
-        json.dump(user_profiles, f, ensure_ascii=False, indent=2)
-
-def save_special_users():
-    with open(SPECIAL_USERS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(special_users, f, ensure_ascii=False, indent=2)
-
-def save_custom_rules():
-    with open(CUSTOM_RULES_FILE, 'w', encoding='utf-8') as f:
-        json.dump(custom_rules, f, ensure_ascii=False, indent=2)
-
-def get_chat_history_file(chat_id):
-    return SESSIONS_DIR / f"chat_history_{chat_id}.json"
-
 TRIGGER_WORDS = ["супер"]
 
-def get_user_status(user_id):
+async def get_user_status(user_id):
     user_id_str = str(user_id)
-    if user_id_str == OWNER_ID or user_id_str in special_users.get("creators", []):
+    if user_id_str == OWNER_ID:
         return "СОЗДАТЕЛЬ"
-    if user_id_str in special_users.get("friends", []):
-        return "ДРУГ"
-    if user_id_str in special_users.get("losers", []):
-        return "ОПУЩЕННЫЙ"
-    return "ОБЫЧНЫЙ"
+    status = await db_get_status(user_id_str)
+    return status
 
-def get_target_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def get_target_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.reply_to_message:
         return str(update.message.reply_to_message.from_user.id)
     elif context.args:
         return context.args[0]
     return None
 
-# --- ОТПРАВКА ОТЧЕТА ГЛАВНОМУ СОЗДАТЕЛЮ ---
+# --- ОТПРАВКА ОТЧЕТА ---
 async def report_to_owner(context: ContextTypes.DEFAULT_TYPE, user_name: str, user_id: str, user_message: str, bot_reply: str):
     if user_id != OWNER_ID:
         try:
@@ -121,209 +189,136 @@ async def report_to_owner(context: ContextTypes.DEFAULT_TYPE, user_name: str, us
         except Exception as e:
             logger.warning(f"Не удалось отправить отчет создателю: {e}")
 
-# --- КОМАНДА /say (УПРАВЛЕНИЕ ИЗ ЛС) ---
+# --- КОМАНДЫ ---
 async def say_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ":
+    if await get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ":
         await update.message.reply_text("⛔ У тебя нет прав на эту команду.")
         return
-        
     if len(context.args) < 2:
-        await update.message.reply_text("Используй: /say [ID чата] [сообщение]\nПример: /say -100123456789 Привет всем!")
+        await update.message.reply_text("Используй: /say [ID чата] [сообщение]")
         return
-
     target_chat_id = context.args[0]
     text_to_send = " ".join(context.args[1:])
-
     try:
         chat_id_int = int(target_chat_id)
         await context.bot.send_message(chat_id=chat_id_int, text=text_to_send)
-        
-        history_file = get_chat_history_file(chat_id_int)
-        history = []
-        if history_file.exists():
-            try:
-                with open(history_file, 'r', encoding='utf-8') as f:
-                    history = json.load(f)
-            except Exception:
-                pass
-        
-        history.append({"role": "model", "text": text_to_send})
-        
-        with open(history_file, 'w', encoding='utf-8') as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
-        
-        await update.message.reply_text(f"✅ Сообщение отправлено в чат {chat_id_int} и сохранено в память.")
-        
-    except ValueError:
-        await update.message.reply_text("❌ Ошибка: ID чата должен быть числом (например, -100123456789).")
+        await db_add_history(str(chat_id_int), "model", text_to_send)
+        await update.message.reply_text(f"✅ Отправлено в {chat_id_int}")
     except Exception as e:
-        logger.error(f"Ошибка при отправке по ID: {e}")
-        await update.message.reply_text(f"❌ Не удалось отправить. Ошибка: {str(e)[:150]}")
+        await update.message.reply_text(f"❌ Ошибка: {str(e)[:150]}")
 
-# --- КОМАНДА /leave (ВЫХОД ИЗ ГРУППЫ ПО ID) ---
 async def leave_chat_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ":
-        await update.message.reply_text("⛔ У тебя нет прав на эту команду.")
-        return
-        
+    if await get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
     if not context.args:
-        await update.message.reply_text("Используй: /leave [ID группы]\nПример: /leave -100123456789")
+        await update.message.reply_text("Используй: /leave [ID группы]")
         return
-
-    target_chat_id = context.args[0]
-
     try:
-        chat_id_int = int(target_chat_id)
+        chat_id_int = int(context.args[0])
         await context.bot.leave_chat(chat_id=chat_id_int)
-        await update.message.reply_text(f"✅ Бот успешно покинул чат {chat_id_int}.")
-        
-    except ValueError:
-        await update.message.reply_text("❌ Ошибка: ID чата должен быть числом (например, -100123456789).")
+        await update.message.reply_text(f"✅ Покинул {chat_id_int}")
     except Exception as e:
-        logger.error(f"Ошибка при выходе из чата {target_chat_id}: {e}")
-        await update.message.reply_text(f"❌ Не удалось выйти. Ошибка: {str(e)[:150]}")
+        await update.message.reply_text(f"❌ Ошибка: {str(e)[:150]}")
 
-# --- НОВЫЕ КОМАНДЫ ДЛЯ ПРАВИЛ ---
 async def add_rule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
-    target_id = None
-    rule_text = ""
+    if await get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
+    target_id = await get_target_id(update, context)
+    rule_text = " ".join(context.args) if update.message.reply_to_message else " ".join(context.args[1:]) if len(context.args) >= 2 else None
     if update.message.reply_to_message:
         target_id = str(update.message.reply_to_message.from_user.id)
-        rule_text = " ".join(context.args) if context.args else ""
+    elif len(context.args) >= 2:
+        target_id = context.args[0]
     else:
-        if len(context.args) >= 2:
-            target_id = context.args[0]
-            rule_text = " ".join(context.args[1:])
-    if not target_id or not rule_text:
-        await update.message.reply_text("Используй: /add_rule [ID] [правило] или ответь на сообщение человека командой /add_rule [правило]")
+        await update.message.reply_text("Формат: /add_rule [ID] [текст]")
         return
-    custom_rules[target_id] = rule_text
-    save_custom_rules()
-    await update.message.reply_text(f"✅ Правило для {target_id} установлено:\n«{rule_text}»")
+    await db_set_rule(target_id, rule_text)
+    await update.message.reply_text(f"✅ Правило для {target_id} установлено.")
 
 async def del_rule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
-    target_id = get_target_id(update, context)
-    if not target_id:
-        await update.message.reply_text("Укажи ID или ответь на сообщение человека.")
-        return
-    if target_id in custom_rules:
-        del custom_rules[target_id]
-        save_custom_rules()
-        await update.message.reply_text(f"🗑 Правило для {target_id} удалено. Теперь он обычный.")
-    else:
-        await update.message.reply_text(f"Для {target_id} нет особых правил.")
+    if await get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
+    target_id = await get_target_id(update, context)
+    if not target_id: return
+    await db_del_rule(target_id)
+    await update.message.reply_text(f"🗑 Правило для {target_id} удалено.")
 
 async def list_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
-    if not custom_rules:
-        await update.message.reply_text("Правил пока нет.")
+    if await get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch('SELECT user_id, rule_text FROM custom_rules')
+    if not rows:
+        await update.message.reply_text("Правил нет.")
         return
-    msg = "<b>📜 ВАШИ ПРАВИЛА:</b>\n"
-    for uid, rule in custom_rules.items():
-        profile = user_profiles.get(uid, {})
-        name = profile.get("first_name", "—")
-        msg += f"\n• <a href='tg://user?id={uid}'>{name}</a> [ID: {uid}]:\n  <i>{rule}</i>"
+    msg = "<b>📜 ПРАВИЛА:</b>\n"
+    for r in rows:
+        name = await db_get_profile_name(r['user_id'])
+        msg += f"\n• <a href='tg://user?id={r['user_id']}'>{name}</a>: <i>{r['rule_text']}</i>"
     await update.message.reply_text(msg, parse_mode="HTML")
 
-# --- КОМАНДА /who ---
 async def who_is_who(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
-    async def get_clickable_name(uid):
-        profile = user_profiles.get(uid)
-        if profile and profile.get("first_name") and profile.get("first_name") != "—":
-            name = profile["first_name"]
-        else:
-            try:
-                chat = await context.bot.get_chat(int(uid))
-                name = chat.first_name or chat.title or "—"
-                if uid not in user_profiles:
-                    user_profiles[uid] = {}
-                user_profiles[uid]["first_name"] = name
-                save_profiles()
-            except Exception:
-                name = "—"
-        return f'<a href="tg://user?id={uid}">{name}</a>'
-    async def format_category(title, user_ids):
-        if not user_ids:
-            return f"{title}\n  (пусто)"
-        text = f"{title}"
-        for uid in user_ids:
-            clickable_name = await get_clickable_name(uid)
-            text += f"\n  • {clickable_name}"
-        return text
+    if await get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
+    owner_name = await db_get_profile_name(OWNER_ID)
+    creators = await db_get_all_with_status("СОЗДАТЕЛЬ")
+    friends = await db_get_all_with_status("ДРУГ")
+    losers = await db_get_all_with_status("ОПУЩЕННЫЙ")
+    
     msg = "<b>👑 КТО КЕМ ЯВЛЯЕТСЯ:</b>\n\n"
-    owner_name = await get_clickable_name(OWNER_ID)
-    msg += f"<b>👑 ГЛАВНЫЙ СОЗДАТЕЛЬ:</b>\n  • {owner_name}\n\n"
-    creators_text = await format_category("<b>👑 ДОПОЛНИТЕЛЬНЫЕ СОЗДАТЕЛИ:</b>", special_users.get("creators", []))
-    friends_text = await format_category("<b>🤝 ДРУЗЬЯ:</b>", special_users.get("friends", []))
-    losers_text = await format_category("<b>🗑 ОПУЩЕННЫЕ:</b>", special_users.get("losers", []))
-    msg += creators_text + "\n\n" + friends_text + "\n\n" + losers_text
+    msg += f"<b>👑 ГЛАВНЫЙ:</b> <a href='tg://user?id={OWNER_ID}'>{owner_name}</a>\n\n"
+    
+    async def format_cat(title, ids):
+        if not ids: return f"{title}\n  (пусто)"
+        text = f"{title}"
+        for uid in ids:
+            name = await db_get_profile_name(uid)
+            text += f"\n  • <a href='tg://user?id={uid}'>{name}</a>"
+        return text
+
+    msg += await format_cat("<b>👑 ДОП. СОЗДАТЕЛИ:</b>", creators) + "\n\n"
+    msg += await format_cat("<b>🤝 ДРУЗЬЯ:</b>", friends) + "\n\n"
+    msg += await format_cat("<b>🗑 ОПУЩЕННЫЕ:</b>", losers)
     await update.message.reply_text(msg, parse_mode="HTML")
 
-# --- КОМАНДЫ НАЗНАЧЕНИЯ ---
 async def set_friend(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
-    target_id = get_target_id(update, context)
+    if await get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
+    target_id = await get_target_id(update, context)
     if target_id:
-        if target_id in special_users["losers"]: special_users["losers"].remove(target_id)
-        if target_id in special_users["creators"]: special_users["creators"].remove(target_id)
-        if target_id not in special_users["friends"]:
-            special_users["friends"].append(target_id)
-            save_special_users()
-            await update.message.reply_text(f"✅ Пользователь {target_id} теперь ДРУГ.")
+        await db_set_status(target_id, "ДРУГ")
+        await update.message.reply_text(f"✅ {target_id} теперь ДРУГ.")
 
 async def set_loser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
-    target_id = get_target_id(update, context)
+    if await get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
+    target_id = await get_target_id(update, context)
     if target_id:
-        if target_id in special_users["friends"]: special_users["friends"].remove(target_id)
-        if target_id in special_users["creators"]: special_users["creators"].remove(target_id)
-        if target_id not in special_users["losers"]:
-            special_users["losers"].append(target_id)
-            save_special_users()
-            await update.message.reply_text(f"✅ Пользователь {target_id} теперь ОПУЩЕННЫЙ.")
+        await db_set_status(target_id, "ОПУЩЕННЫЙ")
+        await update.message.reply_text(f"✅ {target_id} теперь ОПУЩЕННЫЙ.")
 
 async def set_creator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != OWNER_ID: return
-    target_id = get_target_id(update, context)
+    target_id = await get_target_id(update, context)
     if target_id:
-        if target_id in special_users["friends"]: special_users["friends"].remove(target_id)
-        if target_id in special_users["losers"]: special_users["losers"].remove(target_id)
-        if target_id not in special_users["creators"]:
-            special_users["creators"].append(target_id)
-            save_special_users()
-            await update.message.reply_text(f"✅ Пользователь {target_id} теперь СОЗДАТЕЛЬ.")
+        await db_set_status(target_id, "СОЗДАТЕЛЬ")
+        await update.message.reply_text(f"✅ {target_id} теперь СОЗДАТЕЛЬ.")
 
 async def del_friend(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
-    target_id = get_target_id(update, context)
+    if await get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
+    target_id = await get_target_id(update, context)
     if target_id:
-        if target_id in special_users["friends"]:
-            special_users["friends"].remove(target_id)
-            save_special_users()
-            await update.message.reply_text(f"🗑 Пользователь {target_id} удален из ДРУЗЕЙ.")
+        await db_set_status(target_id, "ОБЫЧНЫЙ")
+        await update.message.reply_text(f"🗑 {target_id} удален из ДРУЗЕЙ.")
 
 async def del_loser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
-    target_id = get_target_id(update, context)
+    if await get_user_status(update.effective_user.id) != "СОЗДАТЕЛЬ": return
+    target_id = await get_target_id(update, context)
     if target_id:
-        if target_id in special_users["losers"]:
-            special_users["losers"].remove(target_id)
-            save_special_users()
-            await update.message.reply_text(f"🗑 Пользователь {target_id} удален из ОПУЩЕННЫХ.")
+        await db_set_status(target_id, "ОБЫЧНЫЙ")
+        await update.message.reply_text(f"🗑 {target_id} удален из ОПУЩЕННЫХ.")
 
 async def del_creator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != OWNER_ID: return
-    target_id = get_target_id(update, context)
+    target_id = await get_target_id(update, context)
     if target_id:
-        if target_id in special_users["creators"]:
-            special_users["creators"].remove(target_id)
-            save_special_users()
-            await update.message.reply_text(f"🗑 Пользователь {target_id} удален из СОЗДАТЕЛЕЙ.")
+        await db_set_status(target_id, "ОБЫЧНЫЙ")
+        await update.message.reply_text(f"🗑 {target_id} удален из СОЗДАТЕЛЕЙ.")
 
-# --- ОБРАБОТЧИК МЕДИА ---
+# --- ОБРАБОТЧИКИ ---
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.caption or ""
     chat_type = update.message.chat.type
@@ -342,14 +337,12 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.reply_to_message and update.message.reply_to_message.from_user:
             if update.message.reply_to_message.from_user.id == bot_id:
                 is_reply_to_bot = True
-        
         if is_mentioned or has_trigger or is_reply_to_bot:
             should_respond = True
             if is_mentioned:
                 user_text = user_text.replace(f"@{bot_username}", "").strip()
 
-    if not should_respond:
-        return
+    if not should_respond: return
 
     current_user_id = str(update.effective_user.id)
     current_user_name = update.effective_user.first_name
@@ -392,22 +385,19 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_obj = sticker
             mime_type = "image/webp"
 
-    if not file_obj:
-        return
+    if not file_obj: return
 
     thinking_msg = await update.message.reply_text("🤔 Думаю...")
 
     try:
         tg_file = await context.bot.get_file(file_obj.file_id)
-        
         if tg_file.file_size and tg_file.file_size > 7 * 1024 * 1024:
             await thinking_msg.delete()
             await update.message.reply_text("файл слишком большой.")
             return
-            
         file_bytes = await tg_file.download_as_bytearray()
 
-        status = get_user_status(current_user_id)
+        status = await get_user_status(current_user_id)
         
         if status == "СОЗДАТЕЛЬ":
             status_rules = "Это твой создатель. Общайся с ним уважительно и с радостью ему помогай, если попросит, но сам помочь не предлагай. Его нельзя оскорблять. Называй его босс."
@@ -418,20 +408,19 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             status_rules = "Это обычный пользователь. Общайся нейтрально, вежливо. С радостью ему помогай, если попросит, но сам помочь не предлагай."
 
-        custom_rule_text = ""
-        if current_user_id in custom_rules:
-            custom_rule_text = f"\nОСОБОЕ УКАЗАНИЕ ОТ СОЗДАТЕЛЯ ДЛЯ ЭТОГО ПОЛЬЗОВАТЕЛЯ: {custom_rules[current_user_id]}"
+        custom_rule = await db_get_rule(current_user_id)
+        custom_rule_text = f"\nОСОБОЕ УКАЗАНИЕ: {custom_rule}" if custom_rule else ""
 
         chat_context = (
-            f"ВНИМАНИЕ! ТЕКУЩИЙ СОБЕСЕДНИК: {current_user_name} (ID: {current_user_id}). "
-            f"ЕГО СТАТУС: {status}. {status_rules}{custom_rule_text}"
+            f"ВНИМАНИЕ! СОБЕСЕДНИК: {current_user_name} (ID: {current_user_id}). "
+            f"СТАТУС: {status}. {status_rules}{custom_rule_text}"
         )
 
         personalized_rules = (
+            f"САМОЕ ГЛАВНОЕ ПРАВИЛО: ОТВЕЧАЙ МАКСИМАЛЬНО КОРОТКО. 1-3 предложения.\n\n"
             f"{SYSTEM_RULES}\n\n{chat_context}\n\n"
-            f"--- БАЗА ЗНАНИЙ ПО ИГРЕ ---\n{GAME_KNOWLEDGE}\n--- КОНЕЦ БАЗЫ ЗНАНИЙ ---\n\n"
-            f"ВАЖНО: Используй информацию из базы знаний ТОЛЬКО если пользователь задает вопрос про игру, технику, танки, самолеты или флот. "
-            f"В остальных случаях (приветствие, болтовня, вопросы не по теме) общайся как обычный собеседник и НЕ упоминай базу знаний."
+            f"--- БАЗА ЗНАНИЙ ---\n{GAME_KNOWLEDGE}\n--- КОНЕЦ ---\n\n"
+            f"ВАЖНО: Используй знания ТОЛЬКО если вопрос про игру."
         )
 
         for client_index, client in enumerate(clients):
@@ -445,77 +434,45 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         contents=[text_prompt, file_part],
                         config=types.GenerateContentConfig(
                             system_instruction=personalized_rules,
-                            thinking_config=types.ThinkingConfig(thinking_level="low")
+                            thinking_config=types.ThinkingConfig(thinking_level="low"),
+                            max_output_tokens=150
                         )
                     ),
                     timeout=45.0
                 )
+                reply = response.text if response.text else "не могу распознать."
                 
-                reply = response.text if response.text else "не могу распознать файл."
+                await db_add_history(str(chat_id), "user", f"[{current_user_name} отправил файл]: {text_prompt}")
+                await db_add_history(str(chat_id), "model", reply)
+
+                await thinking_msg.delete()
                 
-                media_history_file = get_chat_history_file(chat_id)
-                media_history = []
-                if media_history_file.exists():
-                    try:
-                        with open(media_history_file, 'r', encoding='utf-8') as f:
-                            media_history = json.load(f)
-                    except Exception:
-                        pass
-                
-                media_history.append({"role": "user", "text": f"[{current_user_name} отправил файл]: {text_prompt}"})
-                media_history.append({"role": "model", "text": reply})
-                
-                with open(media_history_file, 'w', encoding='utf-8') as f:
-                    json.dump(media_history, f, ensure_ascii=False, indent=2)
-                
-                try:
-                    await thinking_msg.delete()
-                except Exception:
-                    pass
-                    
                 if chat_type == 'private' and current_user_id != OWNER_ID:
-                    media_type = "Медиафайл"
-                    if update.message.photo: media_type = "Фото"
-                    elif update.message.voice: media_type = "Голосовое"
-                    elif update.message.video: media_type = "Видео"
-                    await report_to_owner(context, current_user_name, current_user_id, f"[{media_type}] {user_text}", reply)
+                    await report_to_owner(context, current_user_name, current_user_id, f"[Медиа] {user_text}", reply)
 
                 if chat_type in ['group', 'supergroup']:
                     await update.message.reply_text(reply[:4096], reply_to_message_id=update.message.message_id)
                 else:
                     await update.message.reply_text(reply[:4096])
-                    
                 return
 
-            except asyncio.TimeoutError:
-                logger.warning(f"Таймаут при обработке медиа")
-                continue
             except Exception as e:
-                logger.warning(f"⚠️ Ошибка с ключом {client_index + 1}: {str(e)[:150]}")
+                logger.warning(f"⚠️ Ошибка: {str(e)[:150]}")
                 continue
 
-        try:
-            await thinking_msg.delete()
-        except Exception:
-            pass
+        await thinking_msg.delete()
         await update.message.reply_text("не могу распознать файл.")
         
     except Exception as e:
-        logger.error(f"Ошибка скачивания файла: {e}")
-        try:
-            await thinking_msg.delete()
-        except Exception:
-            pass
+        logger.error(f"Ошибка: {e}")
+        try: await thinking_msg.delete()
+        except: pass
         await update.message.reply_text("не могу распознать файл.")
 
-# --- ОБРАБОТЧИК ТЕКСТА ---
-async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ЗАЩИТА ОТ ПУСТЫХ СООБЩЕНИЙ (исправляет ошибку NoneType)
-    if not update.message or not update.message.text:
-        return
-        
-    user_text = update.message.text
 
+async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text: return
+    user_text = update.message.text
     chat_type = update.message.chat.type
     bot_username = context.bot.username
     bot_id = context.bot.id
@@ -525,7 +482,7 @@ async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_user_name = update.effective_user.first_name
     current_username = update.effective_user.username or "нет_юзернейма"
     
-    status = get_user_status(current_user_id)
+    status = await get_user_status(current_user_id)
 
     should_respond = False
     if chat_type == 'private':
@@ -538,31 +495,16 @@ async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.reply_to_message and update.message.reply_to_message.from_user:
             if update.message.reply_to_message.from_user.id == bot_id:
                 is_reply_to_bot = True
-        
         if is_mentioned or has_trigger or is_reply_to_bot:
             should_respond = True
             if is_mentioned:
                 user_text = user_text.replace(f"@{bot_username}", "").strip()
 
-    user_profiles[current_user_id] = {
-        "first_name": current_user_name,
-        "username": current_username,
-        "last_seen": update.message.date.isoformat(),
-        "status": status
-    }
-    save_profiles()
+    await db_save_profile(current_user_id, current_user_name, current_username, update.message.date.isoformat())
 
-    chat_history_file = get_chat_history_file(chat_id)
-    history = []
-    if chat_history_file.exists():
-        try:
-            with open(chat_history_file, 'r', encoding='utf-8') as f:
-                history = json.load(f)
-        except Exception as e:
-            logger.warning(f"Ошибка загрузки истории чата {chat_id}: {e}")
-
+    history = await db_get_history(str(chat_id))
     formatted_message = f"[{current_user_name} (@{current_username}, ID: {current_user_id})]: {user_text}"
-    history.append({"role": "user", "text": formatted_message})
+    await db_add_history(str(chat_id), "user", formatted_message)
 
     if should_respond:
         if status == "СОЗДАТЕЛЬ":
@@ -574,28 +516,24 @@ async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             status_rules = "Это обычный пользователь. Общайся нейтрально, вежливо. С радостью ему помогай, если попросит, но сам помочь не предлагай."
 
-        custom_rule_text = ""
-        if current_user_id in custom_rules:
-            custom_rule_text = f"\nОСОБОЕ УКАЗАНИЕ ОТ СОЗДАТЕЛЯ ДЛЯ ЭТОГО ПОЛЬЗОВАТЕЛЯ: {custom_rules[current_user_id]}"
+        custom_rule = await db_get_rule(current_user_id)
+        custom_rule_text = f"\nОСОБОЕ УКАЗАНИЕ: {custom_rule}" if custom_rule else ""
 
         chat_context = (
-            f"ВНИМАНИЕ! СЕЙЧАС С ТОБОЙ ОБЩАЕТСЯ: {current_user_name} (ID: {current_user_id}). "
-            f"ЕГО СТАТУС: {status}. {status_rules}{custom_rule_text}\n"
-            f"Не забывай свой статус и особые указания при каждом ответе!"
+            f"ВНИМАНИЕ! ОБЩАЕТСЯ: {current_user_name} (ID: {current_user_id}). "
+            f"СТАТУС: {status}. {status_rules}{custom_rule_text}"
         )
 
         personalized_rules = (
+            f"САМОЕ ГЛАВНОЕ ПРАВИЛО: ОТВЕЧАЙ МАКСИМАЛЬНО КОРОТКО. 1-3 предложения.\n\n"
             f"{SYSTEM_RULES}\n\n{chat_context}\n\n"
-            f"--- БАЗА ЗНАНИЙ ПО ИГРЕ ---\n{GAME_KNOWLEDGE}\n--- КОНЕЦ БАЗЫ ЗНАНИЙ ---\n\n"
-            f"ВАЖНО: Используй информацию из базы знаний ТОЛЬКО если пользователь задает вопрос про игру, технику, танки, самолеты или флот. "
-            f"В остальных случаях (приветствие, болтовня, вопросы не по теме) общайся как обычный собеседник и НЕ упоминай базу знаний."
+            f"--- БАЗА ЗНАНИЙ ---\n{GAME_KNOWLEDGE}\n--- КОНЕЦ ---\n\n"
+            f"ВАЖНО: Используй знания ТОЛЬКО если вопрос про игру."
         )
 
         thinking_msg = await update.message.reply_text("🤔 Думаю...")
         
-        gemini_history = []
-        for msg in history:
-            gemini_history.append({"role": msg["role"], "parts": [{"text": msg["text"]}]})
+        gemini_history = [{"role": m["role"], "parts": [{"text": m["text"]}]} for m in history]
 
         for client_index, client in enumerate(clients):
             try:
@@ -604,24 +542,18 @@ async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     history=gemini_history,
                     config=types.GenerateContentConfig(
                         system_instruction=personalized_rules,
-                        thinking_config=types.ThinkingConfig(thinking_level="low")
+                        thinking_config=types.ThinkingConfig(thinking_level="low"),
+                        max_output_tokens=150
                     )
                 )
 
-                max_retries = 3
-                for attempt in range(max_retries):
+                for attempt in range(3):
                     try:
                         response = await chat.send_message(user_text)
-                        reply = response.text if response.text else "не могу ответить на провокацию"
+                        reply = response.text if response.text else "не могу ответить."
                         
-                        history.append({"role": "model", "text": reply})
-                        with open(chat_history_file, 'w', encoding='utf-8') as f:
-                            json.dump(history, f, ensure_ascii=False, indent=2)
-                        
-                        try:
-                            await thinking_msg.delete()
-                        except Exception:
-                            pass
+                        await db_add_history(str(chat_id), "model", reply)
+                        await thinking_msg.delete()
                             
                         if chat_type == 'private' and current_user_id != OWNER_ID:
                             await report_to_owner(context, current_user_name, current_user_id, user_text, reply)
@@ -630,44 +562,41 @@ async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await update.message.reply_text(reply[:4096], reply_to_message_id=update.message.message_id)
                         else:
                             await update.message.reply_text(reply[:4096])
-                            
                         return
                         
                     except Exception as e:
-                        error_msg = str(e)
-                        if "503" in error_msg and attempt < max_retries - 1:
+                        if "503" in str(e) and attempt < 2:
                             await asyncio.sleep(2 ** attempt)
                             continue
                         else:
                             raise e
 
             except Exception as e:
-                logger.warning(f"⚠️ Ошибка с ключом {client_index + 1}: {str(e)[:150]}")
+                logger.warning(f"⚠️ Ошибка с ключом: {str(e)[:150]}")
                 continue
 
-        try:
-            await thinking_msg.delete()
-        except:
-            pass
-        await update.message.reply_text(f"❌ Ошибка Gemini: {error_msg[:300]}")
+        try: await thinking_msg.delete()
+        except: pass
+        await update.message.reply_text("❌ Ошибка Gemini.")
     else:
-        with open(chat_history_file, 'w', encoding='utf-8') as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
+        pass
+
+# --- ЗАПУСК ---
+async def post_init(application):
+    await init_db()
 
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip().replace('\ufeff', '')
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN не найден")
 
-    app = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(token).post_init(post_init).build()
     
     app.add_handler(CommandHandler("say", say_message))
     app.add_handler(CommandHandler("leave", leave_chat_by_id))
-    
     app.add_handler(CommandHandler("add_rule", add_rule))
     app.add_handler(CommandHandler("del_rule", del_rule))
     app.add_handler(CommandHandler("list_rules", list_rules))
-    
     app.add_handler(CommandHandler("who", who_is_who))
     app.add_handler(CommandHandler("setfriend", set_friend))
     app.add_handler(CommandHandler("setloser", set_loser))
@@ -684,7 +613,7 @@ def main():
     )
     app.add_handler(MessageHandler(media_filter, handle_media))
     
-    logger.info("🤖 Бот успешно запущен! Ошибка пустых сообщений исправлена.")
+    logger.info("🤖 Бот запущен с базой данных Supabase!")
     app.run_polling()
 
 if __name__ == "__main__":

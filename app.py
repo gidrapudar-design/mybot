@@ -461,13 +461,13 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
 
         await thinking_msg.delete()
-        await update.message.reply_text("не могу распознать файл.")
+        await update.message.reply_text("не могу сейчас ответить.")
         
     except Exception as e:
         logger.error(f"Ошибка: {e}")
         try: await thinking_msg.delete()
         except: pass
-        await update.message.reply_text("не могу распознать файл.")
+        await update.message.reply_text("не могу сейчас ответить.")
 
 
 async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -577,7 +577,7 @@ async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try: await thinking_msg.delete()
         except: pass
-        await update.message.reply_text("❌ Ошибка Gemini.")
+        await update.message.reply_text("не могу сейчас ответить.")
     else:
         pass
 

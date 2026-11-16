@@ -510,9 +510,11 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- ОБРАБОТЧИК ТЕКСТА ---
 async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    if not user_text:
+    # ЗАЩИТА ОТ ПУСТЫХ СООБЩЕНИЙ (исправляет ошибку NoneType)
+    if not update.message or not update.message.text:
         return
+        
+    user_text = update.message.text
 
     chat_type = update.message.chat.type
     bot_username = context.bot.username
@@ -682,7 +684,7 @@ def main():
     )
     app.add_handler(MessageHandler(media_filter, handle_media))
     
-    logger.info("🤖 Бот успешно запущен! Анимированные стикеры отключены для экономии ресурсов.")
+    logger.info("🤖 Бот успешно запущен! Ошибка пустых сообщений исправлена.")
     app.run_polling()
 
 if __name__ == "__main__":

@@ -427,7 +427,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 response = await asyncio.wait_for(
                     client.aio.models.generate_content(
-                        model='gemini-2.5-flash',
+                        model='gemini-3.5-flash',
                         contents=[text_prompt, file_part],
                         config=types.GenerateContentConfig(
                             system_instruction=personalized_rules,
@@ -535,7 +535,7 @@ async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for client_index, client in enumerate(clients):
             try:
                 chat = client.aio.chats.create(
-                    model='gemini-2.5-flash',
+                    model='gemini-3.5-flash',
                     history=gemini_history,
                     config=types.GenerateContentConfig(
                         system_instruction=personalized_rules,

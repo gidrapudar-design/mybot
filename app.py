@@ -414,7 +414,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         personalized_rules = (
-            f"САМОЕ ГЛАВНОЕ ПРАВИЛО: ОТВЕЧАЙ МАКСИМАЛЬНО КОРОТКО. 1-3 предложения.\n\n"
             f"{SYSTEM_RULES}\n\n{chat_context}\n\n"
             f"--- БАЗА ЗНАНИЙ ---\n{GAME_KNOWLEDGE}\n--- КОНЕЦ ---\n\n"
             f"ВАЖНО: Используй знания ТОЛЬКО если вопрос про игру."
@@ -430,8 +429,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         model='gemini-3.5-flash',
                         contents=[text_prompt, file_part],
                         config=types.GenerateContentConfig(
-                            system_instruction=personalized_rules,
-                            max_output_tokens=150
+                            system_instruction=personalized_rules
                         )
                     ),
                     timeout=45.0
@@ -522,7 +520,6 @@ async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         personalized_rules = (
-            f"САМОЕ ГЛАВНОЕ ПРАВИЛО: ОТВЕЧАЙ МАКСИМАЛЬНО КОРОТКО. 1-3 предложения.\n\n"
             f"{SYSTEM_RULES}\n\n{chat_context}\n\n"
             f"--- БАЗА ЗНАНИЙ ---\n{GAME_KNOWLEDGE}\n--- КОНЕЦ ---\n\n"
             f"ВАЖНО: Используй знания ТОЛЬКО если вопрос про игру."
@@ -538,8 +535,7 @@ async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     model='gemini-3.5-flash',
                     history=gemini_history,
                     config=types.GenerateContentConfig(
-                        system_instruction=personalized_rules,
-                        max_output_tokens=150
+                        system_instruction=personalized_rules
                     )
                 )
 

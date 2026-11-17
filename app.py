@@ -426,7 +426,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 response = await asyncio.wait_for(
                     client.aio.models.generate_content(
-                        model='gemini-3.5-flash',
+                        model='gemini-3.5-flash-lite',
                         contents=[text_prompt, file_part],
                         config=types.GenerateContentConfig(
                             system_instruction=personalized_rules
@@ -532,7 +532,7 @@ async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for client_index, client in enumerate(clients):
             try:
                 chat = client.aio.chats.create(
-                    model='gemini-3.5-flash',
+                    model='gemini-3.5-flash-lite',
                     history=gemini_history,
                     config=types.GenerateContentConfig(
                         system_instruction=personalized_rules
@@ -605,8 +605,11 @@ def main():
     )
     app.add_handler(MessageHandler(media_filter, handle_media))
     
-    logger.info("🤖 Бот запущен с базой данных Supabase! Внутренняя защита статусов.")
+    logger.info("🤖 Бот запущен с базой данных Supabase! Модель 3.5 Flash-Lite.")
     app.run_polling()
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
